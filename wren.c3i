@@ -110,7 +110,7 @@ alias WrenBindForeignClassFn = fn WrenForeignClassMethods (
 
 // Enumerators -----------------------------------------------------------------
 
-enum WrenErrorType : inline CInt
+enum WrenErrorType
 {
     // A syntax or resolution error detected at compile time.
     COMPILE,
@@ -122,7 +122,7 @@ enum WrenErrorType : inline CInt
     STACK_TRACE,
 }
 
-enum WrenInterpretResult : inline CInt
+enum WrenInterpretResult
 {
     SUCCESS,
     COMPILE_ERROR,
@@ -133,7 +133,7 @@ enum WrenInterpretResult : inline CInt
 //
 // This is not necessarily the object's *class*, but instead its low level
 // representation type.
-enum WrenType : inline CInt
+enum WrenType
 {
     BOOL,
     NUM,
