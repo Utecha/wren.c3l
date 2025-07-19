@@ -62,6 +62,12 @@ git clone https://github.com/Utecha/wren.c3l.git
 cd wren.c3l
 ```
 
+Conversely, you can instead use this to also grab the `wren` submodule immediately:
+
+```
+git clone --recurse-submodules https://github.com/Utecha/wren.c3l.git
+```
+
 Wren is no longer really being developed on, and the only real way to use it
 is through the original repository.
 
