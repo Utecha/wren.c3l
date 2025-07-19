@@ -1,0 +1,465 @@
+module wren @if($feature(WREN_NAN_TAGGING));
+
+//------------------------------------------------------------------------------
+// wren_value.h (NaN Tagging)
+//------------------------------------------------------------------------------
+
+typedef Value = inline ulong;
+
+//==============================================================================
+module wren @if(!$feature(WREN_NAN_TAGGING));
+
+//------------------------------------------------------------------------------
+// wren_value.h (Traditional)
+//------------------------------------------------------------------------------
+
+enum ValueType : inline int
+{
+    FALSE,
+    NULL,
+    NUM,
+    TRUE,
+    UNDEFINED,
+    OBJ
+}
+
+struct Value
+{
+    ValueType type;
+    union as
+    {
+        double num;
+        Obj *obj;
+    }
+}
+
+//==============================================================================
+module wren;
+
+//------------------------------------------------------------------------------
+// wren_value.h (Common)
+//------------------------------------------------------------------------------
+
+// The type of a primitive function.
+//
+// Primitives are similar to foreign functions, but have more direct access to
+// VM internals. It is passed the arguments in [args]. If it returns a value,
+// it places it in `args[0]` and returns `true`. If it causes a runtime error
+// or modifies the running fiber, it returns `false`.
+alias Primitive = fn bool (WrenVM *vm, Value *args);
+
+// Tracks how this fiber has been invoked, aside from the ways that can be
+// detected from the state of other fields in the fiber.
+enum FiberState : inline int
+{
+    // The fiber is being run from another fiber using a call to `try()`.
+    TRY,
+
+    // The fiber was directly invoked by `runInterpreter()`. This means it's the
+    // initial fiber used by a call to `wrenCall()` or `wrenInterpret()`.
+    ROOT,
+
+    // The fiber is invoked some other way. If [caller] is `NULL` then the fiber
+    // was invoked using `call()`. If [numFrames] is zero, then the fiber has
+    // finished running and is done. If [numFrames] is one and that frame's `ip`
+    // points to the first byte of code, the fiber has not been started yet.
+    OTHER,
+}
+
+enum MethodType : inline int
+{
+    // A primitive method implemented in C in the VM. Unlike foreign methods,
+    // this can directly manipulate the fiber's stack.
+    PRIMITIVE,
+
+    // A primitive that handles .call on Fn.
+    FUNCTION_CALL,
+
+    // A externally-defined C method.
+    FOREIGN,
+
+    // A normal user-defined method.
+    BLOCK,
+
+    // No method for the given symbol.
+    NONE
+}
+
+// Identifies which specific type a heap-allocated object is.
+enum ObjType : inline int
+{
+    CLASS,
+    CLOSURE,
+    FIBER,
+    FN,
+    FOREIGN,
+    INSTANCE,
+    LIST,
+    MAP,
+    MODULE,
+    RANGE,
+    STRING,
+    UPVALUE
+}
+
+// A quick jump-in from `wren_utils.h`.
+//
+// "We need buffers of a few different types. To avoid lots of casting between
+// void* and back, we'll use the preprocessor as a poor man's generics and let
+// it generate a few type-specific ones."
+//
+// That's what it says for the macro that generates these. These types are not
+// directly declared, but are necessary to define the some Obj types and are also
+// used/referenced by the compiler and VM.
+
+struct ByteBuffer
+{
+    char *data;
+    int count;
+    int capacity;
+}
+
+struct IntBuffer
+{
+    int *data;
+    int count;
+    int capacity;
+}
+
+struct MethodBuffer
+{
+    Method *data;
+    int count;
+    int capacity;
+}
+
+struct ValueBuffer
+{
+    Value *data;
+    int count;
+    int capacity;
+}
+
+struct StringBuffer
+{
+    ObjString *data;
+    int count;
+    int capacity;
+}
+
+// This seems redundant, especially since in Wren this is just done with a typedef.
+// Issues could arise from simply making this a type alias for a `StringBuffer` since
+// we're also working around an FFI.
+struct SymbolTable
+{
+    ObjString *data;
+    int count;
+    int capacity;
+}
+
+// Base struct for all heap-allocated objects.
+struct Obj
+{
+    ObjType type;
+    bool isDark;
+
+    // The object's class.
+    ObjClass *classObj;
+
+    // The next object in the linked list of all currently allocated objects.
+    Obj *next;
+}
+
+struct Method
+{
+    MethodType type;
+
+    // The method function itself. The [type] determines which field of the union
+    // is used.
+    union as
+    {
+        Primitive primitive;
+        WrenForeignMethodFn foreign;
+        ObjClosure *closure;
+    }
+}
+
+struct ObjClass
+{
+    Obj obj;
+    ObjClass *superclass;
+
+    // The number of fields needed for an instance of this class, including all
+    // of its superclass fields.
+    int numFields;
+
+    // The table of methods that are defined in or inherited by this class.
+    // Methods are called by symbol, and the symbol directly maps to an index in
+    // this table. This makes method calls fast at the expense of empty cells in
+    // the list for methods the class doesn't support.
+    //
+    // You can think of it as a hash table that never has collisions but has a
+    // really low load factor. Since methods are pretty small (just a type and a
+    // pointer), this should be a worthwhile trade-off.
+    MethodBuffer methods;
+
+    // The name of the class.
+    ObjString *name;
+
+    // The ClassAttribute for the class, if any
+    Value attributes;
+}
+
+// An instance of a first-class function and the environment it has closed over.
+// Unlike [ObjFn], this has captured the upvalues that the function accesses.
+struct ObjClosure
+{
+    Obj obj;
+
+    // The function that this closure is an instance of.
+    ObjFn *fun;
+
+    // The upvalues this function has closed over.
+    // NOTE: Just to be clear, this is a flexible array of `ObjUpvalue *`.
+    ObjUpvalue *[*] upvalues;
+}
+
+struct CallFrame
+{
+    // Pointer to the current (really next-to-be-executed) instruction in the
+    // function's bytecode.
+    char *ip;
+
+    // The closure being executed.
+    ObjClosure *closure;
+
+    // Pointer to the first stack slot used by this call frame. This will contain
+    // the receiver, followed by the function's parameters, then local variables
+    // and temporaries.
+    Value *stackStart;
+}
+
+struct ObjFiber
+{
+    Obj obj;
+
+    // The stack of value slots. This is used for holding local variables and
+    // temporaries while the fiber is executing. It is heap-allocated and grown
+    // as needed.
+    Value *stack;
+
+    // A pointer to one past the top-most value on the stack.
+    Value *stackTop;
+
+    // The number of allocated slots in the stack array.
+    int stackCapacity;
+
+    // The stack of call frames. This is a dynamic array that grows as needed but
+    // never shrinks.
+    CallFrame *frames;
+
+    // The number of frames currently in use in [frames].
+    int numFrames;
+
+    // The number of [frames] allocated.
+    int frameCapacity;
+
+    // Pointer to the first node in the linked list of open upvalues that are
+    // pointing to values still on the stack. The head of the list will be the
+    // upvalue closest to the top of the stack, and then the list works downwards.
+    ObjUpvalue *openUpvalues;
+
+    // The fiber that ran this one. If this fiber is yielded, control will resume
+    // to this one. May be `NULL`.
+    ObjFiber *caller;
+
+    // If the fiber failed because of a runtime error, this will contain the
+    // error object. Otherwise, it will be null.
+    Value error;
+
+    FiberState state;
+}
+
+// Stores debugging information for a function used for things like stack
+// traces.
+struct FnDebug
+{
+    // The name of the function. Heap allocated and owned by the FnDebug.
+    char * name;
+
+    // An array of line numbers. There is one element in this array for each
+    // bytecode in the function's bytecode array. The value of that element is
+    // the line in the source code that generated that instruction.
+    IntBuffer sourceLines;
+}
+
+// A function object. It wraps and owns the bytecode and other debug information
+// for a callable chunk of code.
+//
+// Function objects are not passed around and invoked directly. Instead, they
+// are always referenced by an [ObjClosure] which is the real first-class
+// representation of a function. This isn't strictly necessary if they function
+// has no upvalues, but lets the rest of the VM assume all called objects will
+// be closures.
+struct ObjFn
+{
+    Obj obj;
+    ByteBuffer code;
+    ValueBuffer constants;
+
+    // The module where this function was defined.
+    ObjModule *_module;
+
+    // The maximum number of stack slots this function may use.
+    int maxSlots;
+
+    // The number of upvalues this function closes over.
+    int numUpvalues;
+
+    // The number of parameters this function expects. Used to ensure that .call
+    // handles a mismatch between number of parameters and arguments. This will
+    // only be set for fns, and not ObjFns that represent methods or scripts.
+    int arity;
+    FnDebug debug;
+}
+
+struct ObjForeign
+{
+    Obj obj;
+    char[*] data;
+}
+
+struct ObjInstance
+{
+    Obj obj;
+    Value[*] fields;
+}
+
+struct ObjList
+{
+    Obj obj;
+
+    // The elements in the list.
+    ValueBuffer elements;
+}
+
+struct MapEntry
+{
+    // The entry's key, or UNDEFINED_VAL if the entry is not in use.
+    Value key;
+
+    // The value associated with the key. If the key is UNDEFINED_VAL, this will
+    // be false to indicate an open available entry or true to indicate a
+    // tombstone -- an entry that was previously in use but was then deleted.
+    Value value;
+}
+
+// A hash table mapping keys to values.
+//
+// We use something very simple: open addressing with linear probing. The hash
+// table is an array of entries. Each entry is a key-value pair. If the key is
+// the special UNDEFINED_VAL, it indicates no value is currently in that slot.
+// Otherwise, it's a valid key, and the value is the value associated with it.
+//
+// When entries are added, the array is dynamically scaled by GROW_FACTOR to
+// keep the number of filled slots under MAP_LOAD_PERCENT. Likewise, if the map
+// gets empty enough, it will be resized to a smaller array. When this happens,
+// all existing entries are rehashed and re-added to the new array.
+//
+// When an entry is removed, its slot is replaced with a "tombstone". This is an
+// entry whose key is UNDEFINED_VAL and whose value is TRUE_VAL. When probing
+// for a key, we will continue past tombstones, because the desired key may be
+// found after them if the key that was removed was part of a prior collision.
+// When the array gets resized, all tombstones are discarded.
+struct ObjMap
+{
+    Obj obj;
+
+    // The number of entries allocated.
+    uint capacity;
+
+    // The number of entries in the map.
+    uint count;
+
+    // Pointer to a contiguous array of [capacity] entries.
+    MapEntry *entries;
+}
+
+// A loaded module and the top-level variables it defines.
+//
+// While this is an Obj and is managed by the GC, it never appears as a
+// first-class object in Wren.
+struct ObjModule
+{
+    Obj obj;
+
+    // The currently defined top-level variables.
+    ValueBuffer variables;
+
+    // Symbol table for the names of all module variables. Indexes here directly
+    // correspond to entries in [variables].
+    SymbolTable variableNames;
+
+    // The name of the module.
+    ObjString *name;
+}
+
+struct ObjRange
+{
+    Obj obj;
+
+    // The beginning of the range.
+    double from;
+
+    // The end of the range. May be greater or less than [from].
+    double to;
+
+    // True if [to] is included in the range.
+    bool isInclusive;
+}
+
+// A heap-allocated string object.
+struct ObjString
+{
+    Obj obj;
+
+    // Number of bytes in the string, not including the null terminator.
+    uint length;
+
+    // The hash value of the string's contents.
+    uint hash;
+
+    // Inline array of the string's bytes followed by a null terminator.
+    char[*] value;
+}
+
+// The dynamically allocated data structure for a variable that has been used
+// by a closure. Whenever a function accesses a variable declared in an
+// enclosing function, it will get to it through this.
+//
+// An upvalue can be either "closed" or "open". An open upvalue points directly
+// to a [Value] that is still stored on the fiber's stack because the local
+// variable is still in scope in the function where it's declared.
+//
+// When that local variable goes out of scope, the upvalue pointing to it will
+// be closed. When that happens, the value gets copied off the stack into the
+// upvalue itself. That way, it can have a longer lifetime than the stack
+// variable.
+struct ObjUpvalue
+{
+    // The object header. Note that upvalues have this because they are garbage
+    // collected, but they are not first class Wren objects.
+    Obj obj;
+
+    // Pointer to the variable this upvalue is referencing.
+    Value *value;
+
+    // If the upvalue is closed (i.e. the local variable it was pointing to has
+    // been popped off the stack) then the closed-over value will be hoisted out
+    // of the stack into here. [value] will then be changed to point to this.
+    Value closed;
+
+    // Open upvalues are stored in a linked list by the fiber. This points to the
+    // next upvalue in that list.
+    ObjUpvalue *next;
+}

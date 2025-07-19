@@ -1,0 +1,363 @@
+module wren;
+
+//------------------------------------------------------------------------------
+// wren_compiler.c
+//------------------------------------------------------------------------------
+
+/*
+ * None of the definitions in this section of the library are user-facing. The
+ * Wren VM contains a reference the the 'Compiler' struct, meaning it was necessary
+ * to include it here.
+ *
+ * The rest is definitions that the Compiler depends on. Since they only exist
+ * for the purpose of satisfying the Wren VM's `Compiler` reference, these are
+ * all listed as `@local` to reflect the actual C implementation where this
+ * data is opaque.
+*/
+
+// The maximum number of local (i.e. not module level) variables that can be
+// declared in a single function, method, or chunk of top level code. This is
+// the maximum number of variables in scope at one time, and spans block scopes.
+//
+// Note that this limitation is also explicit in the bytecode. Since
+// `CODE_LOAD_LOCAL` and `CODE_STORE_LOCAL` use a single argument byte to
+// identify the local, only 256 can be in scope at one time.
+const MAX_LOCALS @local = 256;
+
+// The maximum number of upvalues (i.e. variables from enclosing functions)
+// that a function can close over.
+const MAX_UPVALUES @local = 256;
+
+// The maximum depth that interpolation can nest. For example, this string has
+// three levels:
+//
+//      "outside %(one + "%(two + "%(three)")")"
+const MAX_INTERPOLATION_NESTING @local = 8;
+
+// The different signature syntaxes for different kinds of methods.
+enum SignatureType : inline int @local
+{
+    // A name followed by a (possibly empty) parenthesized parameter list. Also
+    // used for binary operators.
+    METHOD,
+
+    // Just a name. Also used for unary operators.
+    GETTER,
+
+    // A name followed by "=".
+    SETTER,
+
+    // A square bracketed parameter list.
+    SUBSCRIPT,
+
+    // A square bracketed parameter list followed by "=".
+    SUBSCRIPT_SETTER,
+
+    // A constructor initializer function. This has a distinct signature to
+    // prevent it from being invoked directly outside of the constructor on the
+    // metaclass.
+    INITIALIZER
+}
+
+enum TokenType : inline int @local
+{
+    LEFT_PAREN,
+    RIGHT_PAREN,
+    LEFT_BRACKET,
+    RIGHT_BRACKET,
+    LEFT_BRACE,
+    RIGHT_BRACE,
+    COLON,
+    SEMICOLON,
+    DOT,
+    DOTDOT,
+    DOTDOTDOT,
+    COMMA,
+    STAR,
+    SLASH,
+    PERCENT,
+    HASH,
+    PLUS,
+    MINUS,
+    LTLT,
+    GTGT,
+    PIPE,
+    PIPEPIPE,
+    CARET,
+    AMP,
+    AMPAMP,
+    BANG,
+    TILDE,
+    QUESTION,
+    EQ,
+    LT,
+    GT,
+    LTEQ,
+    GTEQ,
+    EQEQ,
+    BANGEQ,
+
+    BREAK,
+    CONTINUE,
+    CLASS,
+    CONSTRUCT,
+    ELSE,
+    FALSE,
+    FOR,
+    FOREIGN,
+    IF,
+    IMPORT,
+    AS,
+    IN,
+    IS,
+    NULL,
+    RETURN,
+    STATIC,
+    SUPER,
+    THIS,
+    TRUE,
+    VAR,
+    WHILE,
+
+    FIELD,
+    STATIC_FIELD,
+    NAME,
+    NUMBER,
+
+    // A string literal without any interpolation, or the last section of a
+    // string following the last interpolated expression.
+    STRING,
+
+    // A portion of a string literal preceding an interpolated expression. This
+    // string:
+    //
+    //     "a %(b) c %(d) e"
+    //
+    // is tokenized to:
+    //
+    //     INTERPOLATION "a "
+    //     NAME          b
+    //     INTERPOLATION " c "
+    //     NAME          d
+    //     STRING        " e"
+    INTERPOLATION,
+    LINE,
+    ERROR,
+    EOF
+}
+
+struct Token @local
+{
+    TokenType type;
+
+    // The beginning of the token, pointing directly into the source.
+    char * start;
+
+    // The length of the token in characters.
+    int length;
+
+    // The 1-based line where the token appears.
+    int line;
+
+    // The parsed value if the token is a literal.
+    Value value;
+}
+
+struct Parser @local
+{
+    WrenVM *vm;
+
+    // The module being parsed.
+    ObjModule *_module;
+
+    // The source code being parsed.
+    char * source;
+
+    // The beginning of the currently-being-lexed token in [source].
+    char * tokenStart;
+
+    // The current character being lexed in [source].
+    char * currentChar;
+
+    // The 1-based line number of [currentChar].
+    int currentLine;
+
+    // The upcoming token.
+    Token next;
+
+    // The most recently lexed token.
+    Token current;
+
+    // The most recently consumed/advanced token.
+    Token previous;
+
+    // Tracks the lexing state when tokenizing interpolated strings.
+    //
+    // Interpolated strings make the lexer not strictly regular: we don't know
+    // whether a ")" should be treated as a RIGHT_PAREN token or as ending an
+    // interpolated expression unless we know whether we are inside a string
+    // interpolation and how many unmatched "(" there are. This is particularly
+    // complex because interpolation can nest:
+    //
+    //     " %( " %( inner ) " ) "
+    //
+    // This tracks that state. The parser maintains a stack of ints, one for each
+    // level of current interpolation nesting. Each value is the number of
+    // unmatched "(" that are waiting to be closed.
+    int[MAX_INTERPOLATION_NESTING] parens;
+    int numParens;
+
+    // Whether compile errors should be printed to stderr or discarded.
+    bool printErrors;
+
+    // If a syntax or compile error has occurred.
+    bool hasError;
+}
+
+struct Local @local
+{
+    // The name of the local variable. This points directly into the original
+    // source code string.
+    char * name;
+
+    // The length of the local variable's name.
+    int length;
+
+    // The depth in the scope chain that this variable was declared at. Zero is
+    // the outermost scope--parameters for a method, or the first local block in
+    // top level code. One is the scope within that, etc.
+    int depth;
+
+    // If this local variable is being used as an upvalue.
+    bool isUpvalue;
+}
+
+struct CompilerUpvalue
+{
+    // True if this upvalue is capturing a local variable from the enclosing
+    // function. False if it's capturing an upvalue.
+    bool isLocal;
+
+    // The index of the local or upvalue being captured in the enclosing function.
+    int index;
+}
+
+// Bookkeeping information for the current loop being compiled.
+struct Loop @local
+{
+    // Index of the instruction that the loop should jump back to.
+    int start;
+
+    // Index of the argument for the CODE_JUMP_IF instruction used to exit the
+    // loop. Stored so we can patch it once we know where the loop ends.
+    int exitJump;
+
+    // Index of the first instruction of the body of the loop.
+    int body;
+
+    // Depth of the scope(s) that need to be exited if a break is hit inside the
+    // loop.
+    int scopeDepth;
+
+    // The loop enclosing this one, or NULL if this is the outermost loop.
+    Loop *enclosing;
+}
+
+struct Signature @local
+{
+    char * name;
+    int length;
+    SignatureType type;
+    int arity;
+}
+
+// Bookkeeping information for compiling a class definition.
+struct ClassInfo @local
+{
+    // The name of the class.
+    ObjString *name;
+
+    // Attributes for the class itself
+    ObjMap *classAttributes;
+
+    // Attributes for methods in this class
+    ObjMap *methodAttributes;
+
+    // Symbol table for the fields of the class.
+    SymbolTable fields;
+
+    // Symbols for the methods defined by the class. Used to detect duplicate
+    // method definitions.
+    IntBuffer methods;
+    IntBuffer staticMethods;
+
+    // True if the class being compiled is a foreign class.
+    bool isForeign;
+
+    // True if the current method being compiled is static.
+    bool inStatic;
+
+    // The signature of the method being compiled.
+    Signature *signature;
+}
+
+struct Compiler
+{
+    Parser *parser;
+
+    // The compiler for the function enclosing this one, or NULL if it's the
+    // top level.
+    Compiler *parent;
+
+    // The currently in scope local variables.
+    Local[MAX_LOCALS] locals;
+
+    // The number of local variables currently in scope.
+    int numLocals;
+
+    // The upvalues that this function has captured from outer scopes. The count
+    // of them is stored in [numUpvalues].
+    CompilerUpvalue[MAX_UPVALUES] upvalues;
+
+    // The current level of block scope nesting, where zero is no nesting. A -1
+    // here means top-level code is being compiled and there is no block scope
+    // in effect at all. Any variables declared will be module-level.
+    int scopeDepth;
+
+    // The current number of slots (locals and temporaries) in use.
+    //
+    // We use this and maxSlots to track the maximum number of additional slots
+    // a function may need while executing. When the function is called, the
+    // fiber will check to ensure its stack has enough room to cover that worst
+    // case and grow the stack if needed.
+    //
+    // This value here doesn't include parameters to the function. Since those
+    // are already pushed onto the stack by the caller and tracked there, we
+    // don't need to double count them here.
+    int numSlots;
+
+    // The current innermost loop being compiled, or NULL if not in a loop.
+    Loop *loop;
+
+    // If this is a compiler for a method, keeps track of the class enclosing it.
+    ClassInfo *enclosingClass;
+
+    // The function being compiled.
+    ObjFn *fun;
+
+    // The constants for the function being compiled.
+    ObjMap *constants;
+
+    // Whether or not the compiler is for a constructor initializer
+    bool isInitializer;
+
+    // The number of attributes seen while parsing.
+    // We track this separately as compile time attributes
+    // are not stored, so we can't rely on attributes->count
+    // to enforce an error message when attributes are used
+    // anywhere other than methods or classes.
+    int numAttributes;
+
+    // Attributes for the next class or method.
+    ObjMap *attributes;
+}
